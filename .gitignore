@@ -1,6 +1,7 @@
 # Large dataset files (too big for GitHub)
 datasets/HLStrans.jsonl
 super_hls_train.jsonl
+super_hls_eval.jsonl
 data/forge_hls_exported.json
 
 # Cloned source repos (re-downloadable)

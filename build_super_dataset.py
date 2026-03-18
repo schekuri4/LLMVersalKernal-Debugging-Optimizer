@@ -1,18 +1,22 @@
 """
-Super-Dataset Builder for HLS Training (3-Pillar Approach)
-==========================================================
-Pillars:
-  1. Gold    – Best-case optimized HLS code (from HLStrans + ForgeHLS)
-  2. Logic   – Complex benchmark kernels (CHStone, MachSuite, Vitis examples)
-  3. Negative – Corrupted code the model learns to fix (auto-generated)
+Versal Kernel Debugging Dataset Builder
+=======================================
+Primary goal: train an LLM to **debug** Versal / Vitis HLS kernels.
 
-Input:
-  - datasets/HLStrans.jsonl  (existing ~124k records, concatenated JSON)
-  - data/forge_hls_exported.json (optional, ForgeHLS export)
-  - data/raw_benchmarks/       (optional, .c/.cpp files from CHStone/MachSuite)
+Data mix (target proportions):
+  ~45 % Debugging  – corrupted HLS code → fixed code
+  ~30 % Optimization – slow C → optimized HLS
+  ~20 % QoR Understanding – code → latency/resource prediction (capped)
+   ~5 % Eval hold-out (written to a separate file)
 
-Output:
-  - super_hls_train.jsonl  (standard newline-delimited JSONL)
+Inputs:
+  - datasets/HLStrans.jsonl  (124k S2S optimization pairs)
+  - data/forge_hls_exported.json (292k QoR prediction records)
+  - data/raw_benchmarks/  (.c/.cpp from CHStone/MachSuite/VitisHLS/HLSyn)
+
+Outputs:
+  - super_hls_train.jsonl  (training set)
+  - super_hls_eval.jsonl   (held-out evaluation set)
 """
 
 import json
@@ -33,12 +37,15 @@ INPUT_FILES = {
     "benchmarks": os.path.join(BASE_DIR, "data", "raw_benchmarks"),
 }
 
-OUTPUT_FILE = os.path.join(BASE_DIR, "super_hls_train.jsonl")
+OUTPUT_TRAIN = os.path.join(BASE_DIR, "super_hls_train.jsonl")
+OUTPUT_EVAL  = os.path.join(BASE_DIR, "super_hls_eval.jsonl")
 
-# What fraction of positive samples to corrupt for debugging pillar
-NEGATIVE_RATIO = 0.50          # 50 % of eligible → negative samples
-NEGATIVE_PASSES = 3            # Generate N debug variants per sampled entry
-RANDOM_SEED    = 42            # For reproducibility
+# ── Tuning knobs ──────────────────────────────────────────
+NEGATIVE_RATIO  = 0.65         # 65 % of eligible gold → debug source pool
+NEGATIVE_PASSES = 4            # 4 corruption variants per sampled entry
+FORGE_QOR_CAP   = 80_000       # Cap QoR records so they don't dominate
+EVAL_FRACTION   = 0.05         # 5 % held out for evaluation
+RANDOM_SEED     = 42
 
 random.seed(RANDOM_SEED)
 
@@ -56,6 +63,12 @@ CORRUPTION_MODES = [
     "remove_pipeline",
     "add_pointer_cast",
     "variable_length_array",
+    "global_variable",
+    "missing_interface",
+    "wrong_loop_bound",
+    "double_free",
+    "new_delete",
+    "float_compare",
 ]
 
 def corrupt_hls_code(code: str, mode: str = None) -> str:
@@ -115,6 +128,38 @@ def corrupt_hls_code(code: str, mode: str = None) -> str:
             corrupted = corrupted.replace(
                 '{', '{\n    int vla_size = 128;\n    int vla_arr[vla_size];\n', 1)
 
+        elif m == "global_variable":
+            corrupted = ("static int _global_state = 0; // BUG: mutable global\n"
+                         + corrupted)
+
+        elif m == "missing_interface":
+            corrupted = re.sub(
+                r'#pragma\s+HLS\s+INTERFACE[^\n]*', '', corrupted)
+            corrupted = re.sub(
+                r'#pragma\s+HLS\s+interface[^\n]*', '', corrupted)
+
+        elif m == "wrong_loop_bound":
+            # Change a loop upper bound to a variable (non-static trip count)
+            corrupted = re.sub(
+                r'for\s*\(([^;]+);\s*([^<>=]+)(<|<=|>|>=)\s*(\d+)',
+                lambda m_: f'for ({m_.group(1)}; {m_.group(2)}{m_.group(3)} unknown_bound',
+                corrupted, count=1)
+            corrupted = ("int unknown_bound = 999; "
+                         "// BUG: non-constant loop bound\n" + corrupted)
+
+        elif m == "double_free":
+            corrupted = corrupted.replace(
+                '{', '{\n    int* _p = (int*)malloc(32);\n    free(_p); free(_p); // double free\n', 1)
+
+        elif m == "new_delete":
+            corrupted = corrupted.replace(
+                '{', '{\n    int* _arr = new int[256]; // BUG: new/delete not synthesizable\n    delete[] _arr;\n', 1)
+
+        elif m == "float_compare":
+            # Inject float equality comparison (unreliable in HW)
+            corrupted = corrupted.replace(
+                '{', '{\n    float _a = 0.1f, _b = 0.2f;\n    if (_a + _b == 0.3f) {} // BUG: float equality\n', 1)
+
     return corrupted
 
 
@@ -127,6 +172,11 @@ DEBUG_INSTRUCTIONS = [
     "Analyze this code for HLS compatibility problems and provide the corrected version.",
     "This FPGA kernel has synthesis errors. Rewrite it so it passes HLS compilation.",
     "Find the hardware-incompatible patterns in this code and replace them with HLS-friendly alternatives.",
+    "This Versal kernel fails to compile in Vitis HLS. Debug it and provide working code.",
+    "Review this HLS/FPGA code for synthesis issues. Output the corrected version.",
+    "The following code has bugs that prevent FPGA synthesis. Identify each issue and fix it.",
+    "This code targets a Xilinx Versal ACAP but has errors. Rewrite it for successful synthesis.",
+    "Debug the following Vitis HLS kernel. Explain what is wrong and provide the fix.",
 ]
 
 
@@ -236,8 +286,11 @@ def create_super_dataset():
             "output": rec.get("output", ""),
         })
 
-    # ── Pillar 1b: Optional ForgeHLS ─────────────────────
+    # ── Pillar 1b: ForgeHLS QoR data (capped) ────────────
     forge_records = read_forgehls(INPUT_FILES["forgehls"])
+    if len(forge_records) > FORGE_QOR_CAP:
+        print(f"  Capping ForgeHLS from {len(forge_records):,} → {FORGE_QOR_CAP:,}")
+        forge_records = random.sample(forge_records, FORGE_QOR_CAP)
     for rec in forge_records:
         master_list.append({
             "instruction": rec.get("instruction",
@@ -246,10 +299,13 @@ def create_super_dataset():
             "output": rec.get("output", rec.get("target", "")),
         })
 
-    # ── Pillar 2: Logic / Benchmark data ──────────────────
+    # ── Pillar 2: Logic / Benchmark data (skip empty outputs) ─
     print("\n[Pillar 2] Loading Complex Logic Benchmarks …")
     bench_samples = read_benchmarks(INPUT_FILES["benchmarks"])
-    master_list.extend(bench_samples)
+    # Only include benchmarks that have an output (non-empty)
+    bench_with_output = [b for b in bench_samples if b.get("output")]
+    print(f"    → {len(bench_with_output):,} have output annotations")
+    master_list.extend(bench_samples)  # keep all, empty-output filtered from debug pool
 
     # ── Pillar 3: Negative / Debugging data ───────────────
     print("\n[Pillar 3] Generating Debugging (Negative) Samples …")
@@ -271,21 +327,52 @@ def create_super_dataset():
     master_list.extend(debug_samples)
     print(f"  → Generated {len(debug_samples):,} debugging samples")
 
-    # ── Shuffle & Write ───────────────────────────────────
-    print(f"\nShuffling {len(master_list):,} total samples …")
-    random.shuffle(master_list)
+    # ── Also generate single-mode debug (easier examples) ─
+    print("  Generating single-bug samples …")
+    single_bug_pool = random.sample(eligible,
+                                    min(len(eligible), int(len(eligible) * 0.25)))
+    single_debug = []
+    for entry in single_bug_pool:
+        mode = random.choice(CORRUPTION_MODES)
+        broken = corrupt_hls_code(entry["output"], mode=mode)
+        single_debug.append({
+            "instruction": random.choice(DEBUG_INSTRUCTIONS),
+            "input":  broken,
+            "output": entry["output"],
+        })
+    master_list.extend(single_debug)
+    print(f"  → Generated {len(single_debug):,} single-bug samples")
 
-    print(f"Writing to {OUTPUT_FILE} …")
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        for entry in master_list:
+    total_debug = len(debug_samples) + len(single_debug)
+
+    # ── Train / Eval split ────────────────────────────────
+    print(f"\nSplitting {len(master_list):,} total samples …")
+    random.shuffle(master_list)
+    n_eval = int(len(master_list) * EVAL_FRACTION)
+    eval_set  = master_list[:n_eval]
+    train_set = master_list[n_eval:]
+
+    print(f"Writing {len(train_set):,} train → {OUTPUT_TRAIN}")
+    with open(OUTPUT_TRAIN, 'w', encoding='utf-8') as f:
+        for entry in train_set:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
-    print(f"\n✓ Done!  Created {len(master_list):,} rows in {OUTPUT_FILE}")
+    print(f"Writing {len(eval_set):,} eval  → {OUTPUT_EVAL}")
+    with open(OUTPUT_EVAL, 'w', encoding='utf-8') as f:
+        for entry in eval_set:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+    print(f"\n✓ Done!")
+    print(f"  Train: {len(train_set):,} rows in {OUTPUT_TRAIN}")
+    print(f"  Eval:  {len(eval_set):,}  rows in {OUTPUT_EVAL}")
     print(f"  Breakdown:")
-    print(f"    Gold (HLStrans):     {len(hlstrans_records):,}")
-    print(f"    Gold (ForgeHLS):     {len(forge_records):,}")
-    print(f"    Logic (Benchmarks):  {len(bench_samples):,}")
-    print(f"    Negative (Debug):    {len(debug_samples):,}")
+    print(f"    Optimize (HLStrans):   {len(hlstrans_records):,}")
+    print(f"    QoR (ForgeHLS capped): {len(forge_records):,}")
+    print(f"    Benchmarks:            {len(bench_samples):,}")
+    print(f"    Debug (multi-bug):     {len(debug_samples):,}")
+    print(f"    Debug (single-bug):    {len(single_debug):,}")
+    print(f"    TOTAL DEBUG:           {total_debug:,}  "
+          f"({total_debug/len(master_list)*100:.1f}%)")
 
 
 if __name__ == "__main__":
