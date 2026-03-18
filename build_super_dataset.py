@@ -181,7 +181,8 @@ def create_super_dataset():
     forge_records = read_forgehls(INPUT_FILES["forgehls"])
     for rec in forge_records:
         master_list.append({
-            "instruction": "Optimize this C code for Xilinx Versal HLS.",
+            "instruction": rec.get("instruction",
+                                   "Optimize this C code for Xilinx Versal HLS."),
             "input":  rec.get("input", rec.get("source", "")),
             "output": rec.get("output", rec.get("target", "")),
         })

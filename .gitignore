@@ -2,7 +2,9 @@
 datasets/HLStrans.jsonl
 super_hls_train.jsonl
 data/forge_hls_exported.json
-data/raw_benchmarks/
+
+# Cloned source repos (re-downloadable)
+repos/
 
 # Python
 __pycache__/
