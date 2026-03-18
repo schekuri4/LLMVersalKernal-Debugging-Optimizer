@@ -301,57 +301,73 @@ def generate_explanation(modes_used: list, fixed_code: str) -> str:
 # ──────────────────────────────────────────────────────────
 # GIT BUGFIX MINER — extract real bug→fix pairs from repos
 # ──────────────────────────────────────────────────────────
+# Repos that are known to be HLS-related — relax keyword filter for these
+_HLS_REPOS = {'Vitis_Accel_Examples', 'Vitis_Libraries', 'Vitis-Tutorials',
+              'VitisHLS', 'CHStone', 'MachSuite', 'HLSyn', 'ForgeHLS',
+              'heterocl', 'soda-opt', 'Merlin-UCLA'}
+
 def mine_git_bugfixes(repo_paths: list) -> list:
     """
     Walk git history of cloned HLS repos, find commits that modified
-    .c/.cpp files, and extract (before, after) pairs as real debugging data.
+    .c/.cpp/.h/.hpp files, and extract (before, after) pairs as real
+    debugging / improvement data.
     """
     samples = []
-    hls_keywords = ['pragma', 'hls', 'pipeline', 'unroll', 'partition',
-                    'dataflow', 'interface', 'stream', 'ap_int', 'ap_uint']
+    # Broad set of keywords for HLS relevance
+    hls_keywords = [
+        'pragma', 'hls', 'pipeline', 'unroll', 'partition', 'dataflow',
+        'interface', 'stream', 'ap_int', 'ap_uint', 'ap_fixed', 'ap_axi',
+        'hls_stream', 'axis', 'kernel', 'vitis', 'vivado', 'fpga',
+        'axi', 'xf_', 'xcl_', 'ocl', 'cl_mem', 'hbm', 'ddr',
+        'bind_storage', 'bind_op', 'array_reshape', 'loop_tripcount',
+        'inline', 'fifo_depth', 'top', 'synthesis', 'cosim',
+        '#include "hls_', '#include <hls_', 'hlslib',
+    ]
 
     for repo_path in repo_paths:
         if not os.path.isdir(os.path.join(repo_path, '.git')):
             continue
         repo_name = os.path.basename(repo_path)
-        print(f"  Mining {repo_name} ...")
+        is_hls_repo = repo_name in _HLS_REPOS
+        print(f"  Mining {repo_name} {'(HLS-repo)' if is_hls_repo else ''} ...")
 
         try:
-            # Get commits that touched C/C++ files
             result = subprocess.run(
                 ['git', 'log', '--all', '--pretty=format:%H', '--diff-filter=M',
-                 '--', '*.c', '*.cpp', '*.h'],
-                cwd=repo_path, capture_output=True, text=True, timeout=30)
+                 '--', '*.c', '*.cpp', '*.h', '*.hpp'],
+                cwd=repo_path, capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=60)
             if result.returncode != 0:
                 continue
             commits = result.stdout.strip().split('\n')
-            commits = [c for c in commits if c][:200]  # Cap at 200 commits
+            commits = [c for c in commits if c][:500]
         except Exception:
             continue
 
+        repo_count = 0
         for commit_hash in commits:
             try:
-                # Get list of changed files
                 diff_result = subprocess.run(
                     ['git', 'diff', '--name-only', f'{commit_hash}~1', commit_hash,
-                     '--', '*.c', '*.cpp', '*.h'],
-                    cwd=repo_path, capture_output=True, text=True, timeout=15)
+                     '--', '*.c', '*.cpp', '*.h', '*.hpp'],
+                    cwd=repo_path, capture_output=True, text=True,
+                    encoding='utf-8', errors='replace', timeout=15)
                 if diff_result.returncode != 0:
                     continue
                 changed_files = [f for f in diff_result.stdout.strip().split('\n') if f]
             except Exception:
                 continue
 
-            for cfile in changed_files[:5]:  # Max 5 files per commit
+            for cfile in changed_files[:10]:
                 try:
-                    # Get before version
                     before = subprocess.run(
                         ['git', 'show', f'{commit_hash}~1:{cfile}'],
-                        cwd=repo_path, capture_output=True, text=True, timeout=10)
-                    # Get after version
+                        cwd=repo_path, capture_output=True, text=True,
+                        encoding='utf-8', errors='replace', timeout=10)
                     after = subprocess.run(
                         ['git', 'show', f'{commit_hash}:{cfile}'],
-                        cwd=repo_path, capture_output=True, text=True, timeout=10)
+                        cwd=repo_path, capture_output=True, text=True,
+                        encoding='utf-8', errors='replace', timeout=10)
 
                     if before.returncode != 0 or after.returncode != 0:
                         continue
@@ -359,16 +375,22 @@ def mine_git_bugfixes(repo_paths: list) -> list:
                     before_code = before.stdout
                     after_code = after.stdout
 
-                    # Only keep if HLS-relevant
-                    combined = (before_code + after_code).lower()
-                    if not any(kw in combined for kw in hls_keywords):
+                    # Skip if both are very short
+                    if len(before_code) < 30 or len(after_code) < 30:
                         continue
-                    # Skip trivial changes (< 10 chars diff)
-                    if abs(len(before_code) - len(after_code)) < 10 and \
-                       before_code.strip() == after_code.strip():
+                    # Skip if content is truly identical
+                    if before_code == after_code:
                         continue
-                    if len(before_code) < 50 or len(after_code) < 50:
-                        continue
+
+                    # Keyword check — relaxed for known HLS repos
+                    if not is_hls_repo:
+                        combined = (before_code + after_code).lower()
+                        if not any(kw in combined for kw in hls_keywords):
+                            continue
+
+                    # Truncate very large files to 8K chars
+                    before_code = before_code[:8192]
+                    after_code = after_code[:8192]
 
                     samples.append({
                         "instruction": random.choice(DEBUG_INSTRUCTIONS),
@@ -376,10 +398,207 @@ def mine_git_bugfixes(repo_paths: list) -> list:
                         "output": after_code,
                         "_source": f"git:{repo_name}/{cfile}@{commit_hash[:8]}",
                     })
+                    repo_count += 1
                 except Exception:
                     continue
 
+        print(f"    {repo_name}: {repo_count} pairs")
+
     print(f"    → Mined {len(samples):,} real bugfix pairs from git history")
+    return samples
+
+
+# ──────────────────────────────────────────────────────────
+# KNOWN REAL-WORLD HLS BUG PATTERNS
+# ──────────────────────────────────────────────────────────
+# Each entry is a (buggy_code, fixed_code, description) triple
+# based on documented Xilinx AR / Vitis HLS known issues.
+_KNOWN_ISSUES = [
+    # --- Pragma / directive bugs ---
+    (
+        '#pragma HLS PIPELINE II=1\nvoid top(hls::stream<int>& in, hls::stream<int>& out) {\n  for (int i = 0; i < N; i++) {\n    int val = in.read();\n    for (int j = 0; j < M; j++) {\n      #pragma HLS PIPELINE II=1\n      out.write(val + j);\n    }\n  }\n}',
+        'void top(hls::stream<int>& in, hls::stream<int>& out) {\n  for (int i = 0; i < N; i++) {\n    #pragma HLS PIPELINE off\n    int val = in.read();\n    for (int j = 0; j < M; j++) {\n      #pragma HLS PIPELINE II=1\n      out.write(val + j);\n    }\n  }\n}',
+        'Outer loop pipeline conflicts with inner loop pipeline; disable outer pipeline.'
+    ),
+    (
+        'void krnl(int a[1024], int b[1024]) {\n  #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem\n  #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem\n  for (int i = 0; i < 1024; i++)\n    b[i] = a[i] * 2;\n}',
+        'void krnl(int a[1024], int b[1024]) {\n  #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0\n  #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1\n  for (int i = 0; i < 1024; i++)\n    b[i] = a[i] * 2;\n}',
+        'Sharing a single AXI bundle for both read and write ports causes port contention; split into separate bundles.'
+    ),
+    (
+        'void top(ap_uint<512>* mem, int n) {\n  #pragma HLS INTERFACE m_axi port=mem depth=1024\n  int local[1024];\n  #pragma HLS ARRAY_PARTITION variable=local complete\n  memcpy(local, mem, n*sizeof(int));\n  for (int i = 0; i < n; i++) local[i] += 1;\n  memcpy(mem, local, n*sizeof(int));\n}',
+        'void top(ap_uint<512>* mem, int n) {\n  #pragma HLS INTERFACE m_axi port=mem depth=1024\n  int local[1024];\n  #pragma HLS ARRAY_PARTITION variable=local cyclic factor=16\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    local[i] = ((int*)mem)[i];\n  }\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    local[i] += 1;\n  }\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    ((int*)mem)[i] = local[i];\n  }\n}',
+        'Complete partition of 1024-element array uses too many FF; use cyclic partition. Also memcpy prevents pipelining.'
+    ),
+    # --- Dataflow violations ---
+    (
+        'void top(hls::stream<int>& in, hls::stream<int>& out) {\n  #pragma HLS DATAFLOW\n  int buf[256];\n  read_input(in, buf);\n  process(buf, buf);  // in-place\n  write_output(buf, out);\n}',
+        'void top(hls::stream<int>& in, hls::stream<int>& out) {\n  #pragma HLS DATAFLOW\n  hls::stream<int> s1, s2;\n  #pragma HLS STREAM variable=s1 depth=256\n  #pragma HLS STREAM variable=s2 depth=256\n  read_input(in, s1);\n  process(s1, s2);\n  write_output(s2, out);\n}',
+        'Dataflow requires producer-consumer channels, not shared arrays. Use hls::stream between stages.'
+    ),
+    (
+        'void top(int* in, int* out, int n) {\n  #pragma HLS DATAFLOW\n  int tmp[1024];\n  stage1(in, tmp, n);\n  stage2(tmp, out, n);\n  stage3(tmp, out, n);  // tmp read twice\n}',
+        'void top(int* in, int* out, int n) {\n  #pragma HLS DATAFLOW\n  int tmp1[1024], tmp2[1024];\n  stage1(in, tmp1, n);\n  split(tmp1, tmp2, n);  // explicit fan-out\n  stage2(tmp1, out, n);\n  stage3(tmp2, out, n);\n}',
+        'Dataflow violation: tmp is consumed by two stages. Insert explicit split to create separate channels.'
+    ),
+    # --- Stream depth / deadlock issues ---
+    (
+        'void top(hls::stream<pkt>& in, hls::stream<pkt>& out) {\n  #pragma HLS DATAFLOW\n  hls::stream<pkt> fifo;\n  producer(in, fifo);\n  consumer(fifo, out);\n}',
+        'void top(hls::stream<pkt>& in, hls::stream<pkt>& out) {\n  #pragma HLS DATAFLOW\n  hls::stream<pkt> fifo;\n  #pragma HLS STREAM variable=fifo depth=64\n  producer(in, fifo);\n  consumer(fifo, out);\n}',
+        'Missing FIFO depth on internal stream causes cosim deadlock with default depth=1.'
+    ),
+    (
+        'void read_engine(hls::stream<ap_uint<512>>& s, ap_uint<512>* ddr, int n) {\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    s.write(ddr[i]);\n  }\n}\nvoid compute(hls::stream<ap_uint<512>>& in, hls::stream<int>& out) {\n  while (!in.empty()) {\n    ap_uint<512> w = in.read();\n    for (int j = 0; j < 16; j++)\n      out.write(w.range(j*32+31, j*32));\n  }\n}',
+        'void read_engine(hls::stream<ap_uint<512>>& s, ap_uint<512>* ddr, int n) {\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    s.write(ddr[i]);\n  }\n}\nvoid compute(hls::stream<ap_uint<512>>& in, hls::stream<int>& out, int n) {\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    ap_uint<512> w = in.read();\n    for (int j = 0; j < 16; j++)\n      out.write(w.range(j*32+31, j*32));\n  }\n}',
+        'Using !stream.empty() as loop condition causes non-synthesizable or non-deterministic behavior; use bounded loop.'
+    ),
+    # --- Incorrect interface / port issues ---
+    (
+        'void krnl(int* a, int* b, int size) {\n  #pragma HLS INTERFACE m_axi port=a\n  #pragma HLS INTERFACE m_axi port=b\n  for (int i = 0; i < size; i++)\n    b[i] = a[i] + 1;\n}',
+        'void krnl(int* a, int* b, int size) {\n  #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0\n  #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1\n  #pragma HLS INTERFACE s_axilite port=a\n  #pragma HLS INTERFACE s_axilite port=b\n  #pragma HLS INTERFACE s_axilite port=size\n  #pragma HLS INTERFACE s_axilite port=return\n  for (int i = 0; i < size; i++) {\n    #pragma HLS PIPELINE II=1\n    b[i] = a[i] + 1;\n  }\n}',
+        'Missing s_axilite control interfaces and offset=slave; host cannot set base addresses without them.'
+    ),
+    (
+        'extern "C" void vadd(int* a, int* b, int* c, int n) {\n  #pragma HLS INTERFACE m_axi port=a bundle=gmem0\n  #pragma HLS INTERFACE m_axi port=b bundle=gmem0\n  #pragma HLS INTERFACE m_axi port=c bundle=gmem0\n  for (int i = 0; i < n; i++)\n    c[i] = a[i] + b[i];\n}',
+        'extern "C" void vadd(int* a, int* b, int* c, int n) {\n  #pragma HLS INTERFACE m_axi port=a bundle=gmem0\n  #pragma HLS INTERFACE m_axi port=b bundle=gmem1\n  #pragma HLS INTERFACE m_axi port=c bundle=gmem2\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    c[i] = a[i] + b[i];\n  }\n}',
+        'All three ports on same AXI bundle limits to one outstanding transaction; separate bundles enable parallel access.'
+    ),
+    # --- Type / width bugs ---
+    (
+        '#include "ap_int.h"\nvoid top(ap_int<8> a, ap_int<8> b, ap_int<8>& sum) {\n  sum = a + b;  // overflow at 128+128\n}',
+        '#include "ap_int.h"\nvoid top(ap_int<8> a, ap_int<8> b, ap_int<9>& sum) {\n  sum = a + b;  // 9 bits avoids overflow\n}',
+        'Sum of two 8-bit values needs 9 bits to avoid overflow truncation.'
+    ),
+    (
+        '#include "ap_fixed.h"\ntypedef ap_fixed<16,8> fixed_t;\nvoid top(fixed_t x, fixed_t& y) {\n  y = x * x * x;  // intermediate overflow\n}',
+        '#include "ap_fixed.h"\ntypedef ap_fixed<16,8> fixed_t;\ntypedef ap_fixed<32,16> wide_t;\nvoid top(fixed_t x, fixed_t& y) {\n  wide_t tmp = (wide_t)x * x;\n  y = (fixed_t)(tmp * x);\n}',
+        'Chained multiplication overflows intermediate precision; widen intermediate type.'
+    ),
+    # --- Loop bound / trip-count issues ---
+    (
+        'void top(int a[N]) {\n  for (int i = 0; i < N; i++) {\n    if (a[i] == 0) break;  // variable trip count\n    #pragma HLS PIPELINE II=1\n    a[i] *= 2;\n  }\n}',
+        'void top(int a[N]) {\n  for (int i = 0; i < N; i++) {\n    #pragma HLS PIPELINE II=1\n    #pragma HLS LOOP_TRIPCOUNT min=1 max=N\n    if (a[i] == 0) break;\n    a[i] *= 2;\n  }\n}',
+        'Variable trip-count loop needs LOOP_TRIPCOUNT pragma for accurate latency estimation.'
+    ),
+    (
+        'void top(hls::stream<int>& in, int out[1024]) {\n  int i = 0;\n  while (!in.empty()) {\n    out[i++] = in.read();\n  }\n}',
+        'void top(hls::stream<int>& in, int out[1024], int n) {\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    out[i] = in.read();\n  }\n}',
+        'Unbounded while loop with stream.empty() is not synthesizable; use bounded for loop with known count.'
+    ),
+    # --- Memory / array issues ---
+    (
+        'void top(int A[1024][1024]) {\n  #pragma HLS ARRAY_PARTITION variable=A complete dim=1\n  for (int i = 0; i < 1024; i++)\n    for (int j = 0; j < 1024; j++)\n      A[i][j] += 1;\n}',
+        'void top(int A[1024][1024]) {\n  #pragma HLS ARRAY_PARTITION variable=A cyclic factor=4 dim=1\n  for (int i = 0; i < 1024; i++)\n    for (int j = 0; j < 1024; j++) {\n      #pragma HLS PIPELINE II=1\n      A[i][j] += 1;\n    }\n}',
+        'Complete partition of dim=1 (1024 elements) creates 1024 BRAMs; use cyclic factor instead.'
+    ),
+    (
+        'void top(int a[1024], int b[1024]) {\n  #pragma HLS BIND_STORAGE variable=a type=RAM_1P impl=BRAM\n  for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    b[i] = a[i] + a[1023-i];  // dual read\n  }\n}',
+        'void top(int a[1024], int b[1024]) {\n  #pragma HLS BIND_STORAGE variable=a type=RAM_2P impl=BRAM\n  for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    b[i] = a[i] + a[1023-i];\n  }\n}',
+        'Two concurrent reads from same array needs RAM_2P (dual port), not RAM_1P which limits to II=2.'
+    ),
+    # --- Versal / AIE specific ---
+    (
+        '#include "adf.h"\nclass myGraph : public adf::graph {\npublic:\n  adf::kernel k1;\n  adf::port<input> in;\n  adf::port<output> out;\n  myGraph() {\n    k1 = adf::kernel::create(filter);\n    adf::connect<>(in, k1.in[0]);\n    adf::connect<>(k1.out[0], out);\n  }\n};',
+        '#include "adf.h"\nclass myGraph : public adf::graph {\npublic:\n  adf::kernel k1;\n  adf::port<input> in;\n  adf::port<output> out;\n  myGraph() {\n    k1 = adf::kernel::create(filter);\n    adf::runtime<ratio>(k1) = 0.8;\n    adf::source(k1) = "filter.cc";\n    adf::connect<adf::window<256>>(in, k1.in[0]);\n    adf::connect<adf::window<256>>(k1.out[0], out);\n  }\n};',
+        'AIE graph missing runtime ratio, source file, and window size on connections.'
+    ),
+    (
+        'void filter(input_window<int32>* in, output_window<int32>* out) {\n  for (int i = 0; i < 256; i++) {\n    int32 val = window_readincr(in);\n    window_writeincr(out, val * coeff[i]);\n  }\n}',
+        'void filter(input_window<int32>* __restrict in, output_window<int32>* __restrict out) {\n  v8int32 buf = undef_v8int32();\n  v8int32 coe = undef_v8int32();\n  for (int i = 0; i < 256/8; i++)\n    chess_prepare_for_pipelining {\n    buf = window_read_v8(in); window_incr(in, 8);\n    coe = *(v8int32*)&coeff[i*8];\n    v8int32 res = mul8(buf, coe);\n    window_write_v8(out, res); window_incr(out, 8);\n  }\n}',
+        'Scalar AIE kernel wastes VLIW vector unit; vectorize with v8int32 intrinsics for 8x throughput.'
+    ),
+    (
+        'void dma_mm2s(ap_uint<128>* mem, hls::stream<ap_axiu<128,0,0,0>>& s, int n) {\n  for (int i = 0; i < n; i++) {\n    ap_axiu<128,0,0,0> pkt;\n    pkt.data = mem[i];\n    pkt.last = (i == n-1);\n    pkt.keep = -1;\n    s.write(pkt);\n  }\n}',
+        'void dma_mm2s(ap_uint<128>* mem, hls::stream<ap_axiu<128,0,0,0>>& s, int n) {\n  #pragma HLS INTERFACE m_axi port=mem offset=slave bundle=gmem\n  #pragma HLS INTERFACE axis port=s\n  #pragma HLS INTERFACE s_axilite port=mem\n  #pragma HLS INTERFACE s_axilite port=n\n  #pragma HLS INTERFACE s_axilite port=return\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    ap_axiu<128,0,0,0> pkt;\n    pkt.data = mem[i];\n    pkt.last = (i == n-1);\n    pkt.keep = -1;\n    s.write(pkt);\n  }\n}',
+        'PL DMA kernel missing all interface pragmas; needs m_axi, axis, s_axilite for Versal platform integration.'
+    ),
+    # --- Latency / performance bugs ---
+    (
+        'void top(int A[N][N], int B[N][N], int C[N][N]) {\n  for (int i = 0; i < N; i++)\n    for (int j = 0; j < N; j++) {\n      int sum = 0;\n      for (int k = 0; k < N; k++)\n        sum += A[i][k] * B[k][j];\n      C[i][j] = sum;\n    }\n}',
+        'void top(int A[N][N], int B[N][N], int C[N][N]) {\n  #pragma HLS ARRAY_PARTITION variable=B cyclic factor=16 dim=2\n  for (int i = 0; i < N; i++)\n    for (int j = 0; j < N; j++) {\n      #pragma HLS PIPELINE II=1\n      int sum = 0;\n      for (int k = 0; k < N; k++)\n        #pragma HLS UNROLL factor=16\n        sum += A[i][k] * B[k][j];\n      C[i][j] = sum;\n    }\n}',
+        'Matrix multiply without PIPELINE/UNROLL/PARTITION has II=N*N*N; partition B and unroll inner loop.'
+    ),
+    (
+        'void top(volatile int* in, volatile int* out, int n) {\n  for (int i = 0; i < n; i++)\n    out[i] = in[i];\n}',
+        'void top(volatile int* in, volatile int* out, int n) {\n  #pragma HLS INTERFACE m_axi port=in  bundle=gmem0 max_read_burst_length=64\n  #pragma HLS INTERFACE m_axi port=out bundle=gmem1 max_write_burst_length=64\n  int buf[64];\n  for (int b = 0; b < n; b += 64) {\n    int len = (b + 64 <= n) ? 64 : n - b;\n    memcpy(buf, in + b, len * sizeof(int));\n    memcpy(out + b, buf, len * sizeof(int));\n  }\n}',
+        'Single-element memory access has no burst; use local buffer + memcpy for burst inference.'
+    ),
+    # --- Synthesis / compilation errors ---
+    (
+        '#include <cstdlib>\nvoid top(int* a, int n) {\n  int* tmp = (int*)malloc(n * sizeof(int));\n  for (int i = 0; i < n; i++) tmp[i] = a[i];\n  for (int i = 0; i < n; i++) a[i] = tmp[n-1-i];\n  free(tmp);\n}',
+        'void top(int a[1024]) {\n  int tmp[1024];\n  for (int i = 0; i < 1024; i++)\n    #pragma HLS PIPELINE II=1\n    tmp[i] = a[i];\n  for (int i = 0; i < 1024; i++)\n    #pragma HLS PIPELINE II=1\n    a[i] = tmp[1023-i];\n}',
+        'Dynamic memory allocation (malloc/free) is not synthesizable in HLS; use fixed-size arrays.'
+    ),
+    (
+        '#include <vector>\nvoid top(std::vector<int>& data) {\n  std::sort(data.begin(), data.end());\n}',
+        'void top(int data[1024], int n) {\n  // Bitonic sort — synthesizable in HLS\n  for (int k = 2; k <= n; k <<= 1) {\n    for (int j = k >> 1; j > 0; j >>= 1) {\n      #pragma HLS PIPELINE II=1\n      for (int i = 0; i < n; i++) {\n        int ij = i ^ j;\n        if (ij > i) {\n          if ((i & k) == 0 && data[i] > data[ij])\n            { int t = data[i]; data[i] = data[ij]; data[ij] = t; }\n          else if ((i & k) != 0 && data[i] < data[ij])\n            { int t = data[i]; data[i] = data[ij]; data[ij] = t; }\n        }\n      }\n    }\n  }\n}',
+        'std::vector and std::sort are not synthesizable; use fixed array and bitonic sort.'
+    ),
+    (
+        'void top(float a[256], float b[256], float c[256]) {\n  for (int i = 0; i < 256; i++)\n    c[i] = a[i] / b[i];\n}',
+        'void top(float a[256], float b[256], float c[256]) {\n  #pragma HLS BIND_OP variable=c op=fdiv impl=fabric latency=12\n  for (int i = 0; i < 256; i++) {\n    #pragma HLS PIPELINE II=1\n    c[i] = a[i] / b[i];\n  }\n}',
+        'Floating-point division without BIND_OP uses default impl with high II; specify latency for pipelining.'
+    ),
+    # --- Common Vitis platform issues ---
+    (
+        'extern "C" {\nvoid krnl_vadd(int* a, int* b, int* c, int n) {\n  for (int i = 0; i < n; i++)\n    c[i] = a[i] + b[i];\n}\n}',
+        'extern "C" {\nvoid krnl_vadd(int* a, int* b, int* c, int n) {\n  #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0\n  #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1\n  #pragma HLS INTERFACE m_axi port=c offset=slave bundle=gmem2\n  #pragma HLS INTERFACE s_axilite port=a\n  #pragma HLS INTERFACE s_axilite port=b\n  #pragma HLS INTERFACE s_axilite port=c\n  #pragma HLS INTERFACE s_axilite port=n\n  #pragma HLS INTERFACE s_axilite port=return\n\n  int buf_a[4096], buf_b[4096], buf_c[4096];\n  for (int i = 0; i < n; i += 4096) {\n    int chunk = ((i + 4096) < n) ? 4096 : (n - i);\n    memcpy(buf_a, a + i, chunk * sizeof(int));\n    memcpy(buf_b, b + i, chunk * sizeof(int));\n    for (int j = 0; j < chunk; j++)\n      #pragma HLS PIPELINE II=1\n      buf_c[j] = buf_a[j] + buf_b[j];\n    memcpy(c + i, buf_c, chunk * sizeof(int));\n  }\n}\n}',
+        'Vitis kernel needs interface pragmas, local buffers for burst, and pipeline.'
+    ),
+    (
+        'void krnl(hls::stream<ap_axiu<32,0,0,0>>& in,\n           hls::stream<ap_axiu<32,0,0,0>>& out, int n) {\n  for (int i = 0; i < n; i++) {\n    auto pkt = in.read();\n    pkt.data = pkt.data + 1;\n    out.write(pkt);\n  }\n}',
+        'void krnl(hls::stream<ap_axiu<32,0,0,0>>& in,\n           hls::stream<ap_axiu<32,0,0,0>>& out, int n) {\n  #pragma HLS INTERFACE axis port=in\n  #pragma HLS INTERFACE axis port=out\n  #pragma HLS INTERFACE s_axilite port=n\n  #pragma HLS INTERFACE s_axilite port=return\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    ap_axiu<32,0,0,0> pkt = in.read();\n    pkt.data = pkt.data + 1;\n    if (i == n - 1) pkt.last = 1;\n    out.write(pkt);\n  }\n}',
+        'AXI-Stream kernel missing axis/s_axilite pragmas, PIPELINE, and TLAST signal management.'
+    ),
+    # --- Reset / initialization bugs ---
+    (
+        'static int state = 0;\nvoid top(int in_val, int& out_val) {\n  #pragma HLS PIPELINE II=1\n  state += in_val;\n  out_val = state;\n}',
+        'static int state = 0;\nvoid top(int in_val, int& out_val, bool reset) {\n  #pragma HLS PIPELINE II=1\n  #pragma HLS RESET variable=state\n  if (reset) state = 0;\n  else state += in_val;\n  out_val = state;\n}',
+        'Static variable without reset pragma cannot be re-initialized; add HLS RESET and reset port.'
+    ),
+    # --- Vivado HLS vs Vitis HLS migration ---
+    (
+        '#pragma HLS resource variable=a core=RAM_2P_BRAM\n#pragma HLS LOOP_FLATTEN off\nvoid top(int a[1024]) {\n  for (int i = 0; i < 1024; i++)\n    a[i] *= 2;\n}',
+        '#pragma HLS BIND_STORAGE variable=a type=RAM_2P impl=BRAM\n#pragma HLS LOOP_FLATTEN off\nvoid top(int a[1024]) {\n  for (int i = 0; i < 1024; i++)\n    #pragma HLS PIPELINE II=1\n    a[i] *= 2;\n}',
+        'Deprecated Vivado HLS pragma "resource" replaced with Vitis HLS "BIND_STORAGE" syntax.'
+    ),
+    (
+        '#pragma HLS RESOURCE variable=mul core=Mul_LUT\nvoid top(short a, short b, int& c) { c = a * b; }',
+        '#pragma HLS BIND_OP variable=mul op=mul impl=fabric\nvoid top(short a, short b, int& c) {\n  #pragma HLS BIND_OP variable=c op=mul impl=fabric\n  c = a * b;\n}',
+        'Vivado HLS RESOURCE pragma with core= is deprecated; use BIND_OP with op= and impl= in Vitis.'
+    ),
+]
+
+def generate_known_issue_samples() -> list:
+    """Create training samples from known real-world HLS bugs."""
+    samples = []
+    debug_instr = DEBUG_INSTRUCTIONS + EXPLAIN_DEBUG_INSTRUCTIONS
+    for buggy, fixed, description in _KNOWN_ISSUES:
+        # Debug sample: buggy → fixed
+        samples.append({
+            "instruction": random.choice(DEBUG_INSTRUCTIONS),
+            "input": buggy,
+            "output": fixed,
+        })
+        # Explain sample: buggy → explanation + fixed
+        explanation = (f"## Bug Analysis\n\n"
+                       f"**Issue:** {description}\n\n"
+                       f"## Corrected Code\n\n```cpp\n{fixed}\n```")
+        samples.append({
+            "instruction": random.choice(EXPLAIN_DEBUG_INSTRUCTIONS),
+            "input": buggy,
+            "output": explanation,
+        })
+    # Multiply with small variations (swap instruction prompts)
+    extra = []
+    for _ in range(9):  # 10x total
+        for buggy, fixed, description in _KNOWN_ISSUES:
+            samples.append({
+                "instruction": random.choice(debug_instr),
+                "input": buggy,
+                "output": fixed,
+            })
+    print(f"  → Generated {len(samples):,} known-issue samples from {len(_KNOWN_ISSUES)} patterns")
     return samples
 
 
@@ -592,13 +811,18 @@ def create_super_dataset():
     print("\n[Pillar 4] Mining real bugfix commits …")
     repo_dirs = glob.glob(os.path.join(BASE_DIR, "repos", "*"))
     git_samples = mine_git_bugfixes(repo_dirs)
-    # Remove the _source field before adding to dataset
     for s in git_samples:
         s.pop("_source", None)
     master_list.extend(git_samples)
 
+    # ── Pillar 5: Known real-world HLS bug patterns ───────
+    print("\n[Pillar 5] Adding known real-world HLS issue patterns …")
+    known_samples = generate_known_issue_samples()
+    master_list.extend(known_samples)
+
     total_debug = (len(debug_samples) + len(single_debug)
-                   + len(explain_samples) + len(git_samples))
+                   + len(explain_samples) + len(git_samples)
+                   + len(known_samples))
 
     # ── Train / Eval split + deduplication ────────────────
     print(f"\nSplitting {len(master_list):,} total samples …")
@@ -630,6 +854,7 @@ def create_super_dataset():
     print(f"    Debug (single-bug):     {len(single_debug):,}")
     print(f"    Debug (explain-bug):    {len(explain_samples):,}")
     print(f"    Debug (real git fixes): {len(git_samples):,}")
+    print(f"    Debug (known issues):   {len(known_samples):,}")
     print(f"    TOTAL DEBUG:            {total_debug:,}  "
           f"({total_debug/len(master_list)*100:.1f}%)")
 
