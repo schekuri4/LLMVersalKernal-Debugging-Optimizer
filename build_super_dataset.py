@@ -36,7 +36,8 @@ INPUT_FILES = {
 OUTPUT_FILE = os.path.join(BASE_DIR, "super_hls_train.jsonl")
 
 # What fraction of positive samples to corrupt for debugging pillar
-NEGATIVE_RATIO = 0.15          # 15 % of gold → negative samples
+NEGATIVE_RATIO = 0.50          # 50 % of eligible → negative samples
+NEGATIVE_PASSES = 3            # Generate N debug variants per sampled entry
 RANDOM_SEED    = 42            # For reproducibility
 
 random.seed(RANDOM_SEED)
@@ -45,30 +46,88 @@ random.seed(RANDOM_SEED)
 # ──────────────────────────────────────────────────────────
 # CORRUPTER  –  turns good HLS into broken "software" code
 # ──────────────────────────────────────────────────────────
-def corrupt_hls_code(code: str) -> str:
+# Distinct corruption strategies — each produces a different class of bug
+CORRUPTION_MODES = [
+    "strip_pragmas",
+    "revert_types",
+    "inject_malloc",
+    "inject_recursion",
+    "swap_stream",
+    "remove_pipeline",
+    "add_pointer_cast",
+    "variable_length_array",
+]
+
+def corrupt_hls_code(code: str, mode: str = None) -> str:
     """
     Creates 'Negative' data by degrading hardware-aware C/C++ back into
     naive software C that will fail or bottleneck during HLS synthesis.
+    If *mode* is None a random subset of corruptions is applied.
     """
+    if mode is None:
+        # Apply 2-4 random corruptions
+        modes = random.sample(CORRUPTION_MODES,
+                              k=random.randint(2, min(4, len(CORRUPTION_MODES))))
+    else:
+        modes = [mode]
+
     corrupted = code
 
-    # 1. Strip all HLS pragmas
-    corrupted = re.sub(r'#pragma\s+HLS\s+[^\n]*', '', corrupted)
+    for m in modes:
+        if m == "strip_pragmas":
+            corrupted = re.sub(r'#pragma\s+HLS\s+[^\n]*', '', corrupted)
 
-    # 2. Revert ap_int / ap_uint to standard int types
-    corrupted = corrupted.replace('ap_int', 'int').replace('ap_uint', 'unsigned int')
-    corrupted = re.sub(r'ap_fixed<[^>]*>', 'float', corrupted)
+        elif m == "revert_types":
+            corrupted = corrupted.replace('ap_int', 'int')
+            corrupted = corrupted.replace('ap_uint', 'unsigned int')
+            corrupted = re.sub(r'ap_fixed<[^>]*>', 'float', corrupted)
 
-    # 3. Randomly inject a synthesizability bug (malloc / dynamic alloc)
-    if random.random() < 0.20:
-        corrupted = "// FIX THIS: Illegal hardware operation detected\n" + corrupted
-        corrupted = corrupted.replace('{', '{\n    int* tmp = (int*)malloc(64);', 1)
+        elif m == "inject_malloc":
+            corrupted = ("// BUG: dynamic allocation is not synthesizable\n"
+                         + corrupted)
+            corrupted = corrupted.replace(
+                '{', '{\n    int* tmp = (int*)malloc(64);', 1)
 
-    # 4. Occasionally replace hls::stream with std::queue (non-synthesizable)
-    if random.random() < 0.15:
-        corrupted = corrupted.replace('hls::stream', 'std::queue')
+        elif m == "inject_recursion":
+            # Wrap body in a fake recursive helper
+            corrupted = ("// BUG: recursion is not synthesizable\n"
+                         "void _recursive_helper(int n) {\n"
+                         "    if (n <= 0) return;\n"
+                         "    _recursive_helper(n - 1);\n"
+                         "}\n\n" + corrupted)
+
+        elif m == "swap_stream":
+            corrupted = corrupted.replace('hls::stream', 'std::queue')
+
+        elif m == "remove_pipeline":
+            corrupted = re.sub(
+                r'#pragma\s+HLS\s+PIPELINE[^\n]*', '', corrupted)
+            corrupted = re.sub(
+                r'#pragma\s+HLS\s+pipeline[^\n]*', '', corrupted)
+
+        elif m == "add_pointer_cast":
+            corrupted = corrupted.replace(
+                '{', '{\n    void* _bad = (void*)0xDEAD; // non-synthesizable ptr\n', 1)
+
+        elif m == "variable_length_array":
+            corrupted = ("// BUG: VLA not supported in HLS\n"
+                         + corrupted)
+            corrupted = corrupted.replace(
+                '{', '{\n    int vla_size = 128;\n    int vla_arr[vla_size];\n', 1)
 
     return corrupted
+
+
+# Varied instruction prompts so the model learns multiple debugging phrasings
+DEBUG_INSTRUCTIONS = [
+    "Identify and fix the HLS synthesis errors or bottlenecks in this code.",
+    "This code fails Vivado HLS synthesis. Find and correct all issues.",
+    "Debug this C/C++ code so it is fully synthesizable with Xilinx Vitis HLS.",
+    "The following HLS code contains non-synthesizable constructs. Fix them.",
+    "Analyze this code for HLS compatibility problems and provide the corrected version.",
+    "This FPGA kernel has synthesis errors. Rewrite it so it passes HLS compilation.",
+    "Find the hardware-incompatible patterns in this code and replace them with HLS-friendly alternatives.",
+]
 
 
 # ──────────────────────────────────────────────────────────
@@ -194,21 +253,20 @@ def create_super_dataset():
 
     # ── Pillar 3: Negative / Debugging data ───────────────
     print("\n[Pillar 3] Generating Debugging (Negative) Samples …")
-    eligible = [e for e in master_list if e.get("output")]
-    n_negative = min(len(eligible), int(len(hlstrans_records) * NEGATIVE_RATIO))
+    eligible = [e for e in master_list if e.get("output") and len(e["output"]) > 80]
+    n_negative = min(len(eligible), int(len(eligible) * NEGATIVE_RATIO))
     debug_pool = random.sample(eligible, n_negative)
 
     debug_samples = []
     for entry in debug_pool:
-        broken_code = corrupt_hls_code(entry["output"])
-        debug_samples.append({
-            "instruction": (
-                "Identify and fix the HLS synthesis errors or "
-                "bottlenecks in this code."
-            ),
-            "input":  broken_code,
-            "output": entry["output"],
-        })
+        # Generate NEGATIVE_PASSES different corruptions per entry
+        for _ in range(NEGATIVE_PASSES):
+            broken_code = corrupt_hls_code(entry["output"])
+            debug_samples.append({
+                "instruction": random.choice(DEBUG_INSTRUCTIONS),
+                "input":  broken_code,
+                "output": entry["output"],
+            })
 
     master_list.extend(debug_samples)
     print(f"  → Generated {len(debug_samples):,} debugging samples")
