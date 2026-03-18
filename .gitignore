@@ -1,0 +1,11 @@
+# Large dataset files (too big for GitHub)
+datasets/HLStrans.jsonl
+super_hls_train.jsonl
+data/forge_hls_exported.json
+data/raw_benchmarks/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
