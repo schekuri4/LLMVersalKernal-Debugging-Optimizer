@@ -304,7 +304,9 @@ def generate_explanation(modes_used: list, fixed_code: str) -> str:
 # Repos that are known to be HLS-related — relax keyword filter for these
 _HLS_REPOS = {'Vitis_Accel_Examples', 'Vitis_Libraries', 'Vitis-Tutorials',
               'VitisHLS', 'CHStone', 'MachSuite', 'HLSyn', 'ForgeHLS',
-              'heterocl', 'soda-opt', 'Merlin-UCLA'}
+              'heterocl', 'soda-opt', 'Merlin-UCLA', 'XRT', 'AutoBridge',
+              'Vitis-AI', 'Odyssey', 'OpenFPGA', 'mlir-aie',
+              'vtr-verilog-to-routing'}
 
 def mine_git_bugfixes(repo_paths: list) -> list:
     """
@@ -566,6 +568,117 @@ _KNOWN_ISSUES = [
         '#pragma HLS RESOURCE variable=mul core=Mul_LUT\nvoid top(short a, short b, int& c) { c = a * b; }',
         '#pragma HLS BIND_OP variable=mul op=mul impl=fabric\nvoid top(short a, short b, int& c) {\n  #pragma HLS BIND_OP variable=c op=mul impl=fabric\n  c = a * b;\n}',
         'Vivado HLS RESOURCE pragma with core= is deprecated; use BIND_OP with op= and impl= in Vitis.'
+    ),
+    # --- Additional real-world patterns ---
+    (
+        'void top(int in[1024], int out[1024]) {\n  #pragma HLS DATAFLOW\n  int buf[1024];\n  for (int i = 0; i < 1024; i++) buf[i] = in[i];\n  for (int i = 0; i < 1024; i++) buf[i] = buf[i] * 2;\n  for (int i = 0; i < 1024; i++) out[i] = buf[i];\n}',
+        'void top(int in[1024], int out[1024]) {\n  #pragma HLS DATAFLOW\n  hls::stream<int> s1, s2;\n  #pragma HLS STREAM variable=s1 depth=16\n  #pragma HLS STREAM variable=s2 depth=16\n  load: for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    s1.write(in[i]);\n  }\n  compute: for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    s2.write(s1.read() * 2);\n  }\n  store: for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    out[i] = s2.read();\n  }\n}',
+        'Dataflow with shared array buf violates single-producer single-consumer rule; convert to stream channels.'
+    ),
+    (
+        'void top(hls::stream<int>& in, hls::stream<int>& out) {\n  int acc = 0;\n  LOOP: for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    acc += in.read();\n  }\n  out.write(acc);\n}',
+        'void top(hls::stream<int>& in, hls::stream<int>& out) {\n  #pragma HLS INTERFACE axis port=in\n  #pragma HLS INTERFACE axis port=out\n  #pragma HLS INTERFACE ap_ctrl_none port=return\n  int acc = 0;\n  LOOP: for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    acc += in.read();\n  }\n  out.write(acc);\n}',
+        'Streaming kernel missing axis interface pragmas; host cannot connect AXI-Stream ports without them.'
+    ),
+    (
+        'void conv2d(int img[H][W], int kernel[K][K], int out[H][W]) {\n  for (int r = 0; r < H; r++)\n    for (int c = 0; c < W; c++) {\n      int sum = 0;\n      for (int kr = 0; kr < K; kr++)\n        for (int kc = 0; kc < K; kc++)\n          sum += img[r+kr][c+kc] * kernel[kr][kc];\n      out[r][c] = sum;\n    }\n}',
+        'void conv2d(int img[H][W], int kernel[K][K], int out[H][W]) {\n  #pragma HLS ARRAY_PARTITION variable=kernel complete\n  int linebuf[K][W];\n  #pragma HLS ARRAY_PARTITION variable=linebuf complete dim=1\n  for (int r = 0; r < H; r++)\n    for (int c = 0; c < W; c++) {\n      #pragma HLS PIPELINE II=1\n      // Shift line buffer\n      for (int kr = 0; kr < K-1; kr++)\n        linebuf[kr][c] = linebuf[kr+1][c];\n      linebuf[K-1][c] = img[r][c];\n      if (r >= K-1 && c >= K-1) {\n        int sum = 0;\n        for (int kr = 0; kr < K; kr++)\n          #pragma HLS UNROLL\n          for (int kc = 0; kc < K; kc++)\n            #pragma HLS UNROLL\n            sum += linebuf[kr][c-K+1+kc] * kernel[kr][kc];\n        out[r-K+1][c-K+1] = sum;\n      }\n    }\n}',
+        'Naive 2D convolution has random memory access pattern; use line buffer for streaming access with II=1.'
+    ),
+    (
+        'void top(ap_uint<512>* mem, int n) {\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    ap_uint<512> word = mem[i];\n    // process 16 ints packed in 512 bits\n    for (int j = 0; j < 16; j++) {\n      int val = word.range(j*32+31, j*32);\n      // ... process val\n    }\n  }\n}',
+        'void top(ap_uint<512>* mem, int n) {\n  #pragma HLS INTERFACE m_axi port=mem offset=slave bundle=gmem max_read_burst_length=64\n  #pragma HLS INTERFACE s_axilite port=mem\n  #pragma HLS INTERFACE s_axilite port=n\n  #pragma HLS INTERFACE s_axilite port=return\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    ap_uint<512> word = mem[i];\n    for (int j = 0; j < 16; j++) {\n      #pragma HLS UNROLL\n      int val = word.range(j*32+31, j*32);\n      // ... process val\n    }\n  }\n}',
+        'Wide-bus access pattern missing interface pragmas and inner loop UNROLL; prevents burst and serializes extraction.'
+    ),
+    (
+        '#include "hls_stream.h"\nvoid split(hls::stream<int>& in, hls::stream<int>& out1, hls::stream<int>& out2, int n) {\n  for (int i = 0; i < n; i++) {\n    int val = in.read();\n    out1.write(val);\n    out2.write(val);\n  }\n}\nvoid top(hls::stream<int>& in, hls::stream<int>& out1, hls::stream<int>& out2) {\n  #pragma HLS DATAFLOW\n  hls::stream<int> mid;\n  split(in, out1, out2, 1024);\n}',
+        '#include "hls_stream.h"\nvoid split(hls::stream<int>& in, hls::stream<int>& out1, hls::stream<int>& out2, int n) {\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    int val = in.read();\n    out1.write(val);\n    out2.write(val);\n  }\n}\nvoid top(hls::stream<int>& in, hls::stream<int>& out1, hls::stream<int>& out2) {\n  #pragma HLS DATAFLOW\n  hls::stream<int> mid;\n  #pragma HLS STREAM variable=mid depth=32\n  split(in, out1, out2, 1024);\n}',
+        'Split function missing PIPELINE; internal stream missing depth pragma causes potential backpressure deadlock.'
+    ),
+    (
+        'void top(int A[N][N], int B[N][N], int C[N][N]) {\n  for (int i = 0; i < N; i++) {\n    for (int j = 0; j < N; j++) {\n      #pragma HLS PIPELINE II=1\n      C[i][j] = 0;\n      for (int k = 0; k < N; k++)\n        C[i][j] += A[i][k] * B[k][j];\n    }\n  }\n}',
+        'void top(int A[N][N], int B[N][N], int C[N][N]) {\n  #pragma HLS ARRAY_PARTITION variable=A cyclic factor=8 dim=2\n  #pragma HLS ARRAY_PARTITION variable=B cyclic factor=8 dim=1\n  for (int i = 0; i < N; i++) {\n    for (int j = 0; j < N; j++) {\n      #pragma HLS PIPELINE II=1\n      int sum = 0;\n      for (int k = 0; k < N; k++)\n        #pragma HLS UNROLL factor=8\n        sum += A[i][k] * B[k][j];\n      C[i][j] = sum;\n    }\n  }\n}',
+        'Matrix multiply accumulates directly into C array causing read-after-write; use local sum variable. Also needs partition+unroll for parallelism.'
+    ),
+    (
+        'void histogram(int data[N], int hist[256]) {\n  for (int i = 0; i < N; i++) {\n    #pragma HLS PIPELINE II=1\n    hist[data[i]]++;\n  }\n}',
+        'void histogram(int data[N], int hist[256]) {\n  #pragma HLS ARRAY_PARTITION variable=hist complete\n  int local_hist[256];\n  #pragma HLS ARRAY_PARTITION variable=local_hist complete\n  for (int i = 0; i < 256; i++)\n    #pragma HLS UNROLL\n    local_hist[i] = 0;\n  for (int i = 0; i < N; i++) {\n    #pragma HLS PIPELINE II=1\n    #pragma HLS DEPENDENCE variable=local_hist inter false\n    local_hist[data[i]]++;\n  }\n  for (int i = 0; i < 256; i++)\n    #pragma HLS UNROLL\n    hist[i] = local_hist[i];\n}',
+        'Histogram has read-after-write dependency on hist array giving II=2+; use local copy with DEPENDENCE false pragma.'
+    ),
+    (
+        'void top(float input[256], float weights[256][128], float output[128]) {\n  for (int j = 0; j < 128; j++) {\n    float sum = 0;\n    for (int i = 0; i < 256; i++)\n      sum += input[i] * weights[i][j];\n    output[j] = sum;\n  }\n}',
+        'void top(float input[256], float weights[256][128], float output[128]) {\n  #pragma HLS ARRAY_PARTITION variable=input cyclic factor=4\n  #pragma HLS ARRAY_PARTITION variable=weights cyclic factor=4 dim=1\n  for (int j = 0; j < 128; j++) {\n    #pragma HLS PIPELINE II=1\n    float sum = 0;\n    for (int i = 0; i < 256; i++)\n      #pragma HLS UNROLL factor=4\n      sum += input[i] * weights[i][j];\n    output[j] = sum;\n  }\n}',
+        'Dense layer without partitioning or unrolling is fully sequential; partition inputs and unroll dot product.'
+    ),
+    (
+        'void top(hls::stream<axis_t>& in, hls::stream<axis_t>& out) {\n  axis_t pkt;\n  do {\n    pkt = in.read();\n    pkt.data += 1;\n    out.write(pkt);\n  } while (!pkt.last);\n}',
+        'void top(hls::stream<axis_t>& in, hls::stream<axis_t>& out) {\n  #pragma HLS INTERFACE axis port=in\n  #pragma HLS INTERFACE axis port=out\n  #pragma HLS INTERFACE ap_ctrl_none port=return\n  bool last = false;\n  while (!last) {\n    #pragma HLS PIPELINE II=1\n    axis_t pkt = in.read();\n    last = pkt.last;\n    pkt.data += 1;\n    out.write(pkt);\n  }\n}',
+        'Do-while with TLAST check processes one extra packet; restructure as while-not-last. Add interface pragmas and ap_ctrl_none for free-running kernel.'
+    ),
+    (
+        'void top(int A[100], int B[100]) {\n  #pragma HLS ALLOCATION instances=mul limit=1 function\n  for (int i = 0; i < 100; i++) {\n    #pragma HLS PIPELINE II=1\n    B[i] = A[i] * A[i] * A[i];  // needs 2 muls\n  }\n}',
+        'void top(int A[100], int B[100]) {\n  for (int i = 0; i < 100; i++) {\n    #pragma HLS PIPELINE II=1\n    int sq = A[i] * A[i];\n    B[i] = sq * A[i];\n  }\n}',
+        'ALLOCATION limiting to 1 multiplier conflicts with II=1 when 2 muls needed per iteration; remove allocation or restructure.'
+    ),
+    (
+        'void aes_encrypt(ap_uint<128> key, ap_uint<128> plaintext, ap_uint<128>& ciphertext) {\n  ap_uint<128> state = plaintext ^ key;\n  for (int round = 1; round < 10; round++) {\n    state = sub_bytes(state);\n    state = shift_rows(state);\n    state = mix_columns(state);\n    state = add_round_key(state, round_keys[round]);\n  }\n  state = sub_bytes(state);\n  state = shift_rows(state);\n  ciphertext = state ^ round_keys[10];\n}',
+        'void aes_encrypt(ap_uint<128> key, ap_uint<128> plaintext, ap_uint<128>& ciphertext) {\n  #pragma HLS PIPELINE II=1\n  #pragma HLS ARRAY_PARTITION variable=round_keys complete\n  #pragma HLS ARRAY_PARTITION variable=sbox complete\n  ap_uint<128> state = plaintext ^ key;\n  for (int round = 1; round < 10; round++) {\n    #pragma HLS UNROLL\n    state = sub_bytes(state);\n    state = shift_rows(state);\n    state = mix_columns(state);\n    state = add_round_key(state, round_keys[round]);\n  }\n  state = sub_bytes(state);\n  state = shift_rows(state);\n  ciphertext = state ^ round_keys[10];\n}',
+        'AES without full unroll and partition serializes all 10 rounds; unroll rounds and partition lookup tables for single-cycle throughput.'
+    ),
+    (
+        'void top(int* input, int* output, int n) {\n  for (int i = 1; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    output[i] = input[i] + output[i-1]; // feedback\n  }\n}',
+        'void top(int* input, int* output, int n) {\n  #pragma HLS INTERFACE m_axi port=input bundle=gmem0\n  #pragma HLS INTERFACE m_axi port=output bundle=gmem1\n  int local_in[4096], local_out[4096];\n  for (int b = 0; b < n; b += 4096) {\n    int chunk = (b+4096<n) ? 4096 : n-b;\n    memcpy(local_in, input+b, chunk*sizeof(int));\n    local_out[0] = local_in[0] + (b>0 ? local_out[chunk-1] : 0);\n    for (int i = 1; i < chunk; i++) {\n      #pragma HLS PIPELINE II=1\n      #pragma HLS DEPENDENCE variable=local_out inter distance=1 true\n      local_out[i] = local_in[i] + local_out[i-1];\n    }\n    memcpy(output+b, local_out, chunk*sizeof(int));\n  }\n}',
+        'Prefix-sum on external memory has II=N due to pointer aliasing; tile with local buffers and use DEPENDENCE pragma for carried dependency.'
+    ),
+    (
+        'void top(hls::stream<int>& in, hls::stream<int>& out, int n) {\n  int buf[MAX_N];\n  for (int i = 0; i < n; i++) buf[i] = in.read();\n  // reverse\n  for (int i = 0; i < n; i++) out.write(buf[n-1-i]);\n}',
+        'void top(hls::stream<int>& in, hls::stream<int>& out, int n) {\n  #pragma HLS INTERFACE axis port=in\n  #pragma HLS INTERFACE axis port=out\n  #pragma HLS INTERFACE s_axilite port=n\n  #pragma HLS INTERFACE s_axilite port=return\n  int buf[MAX_N];\n  #pragma HLS BIND_STORAGE variable=buf type=RAM_2P impl=BRAM\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    buf[i] = in.read();\n  }\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    out.write(buf[n-1-i]);\n  }\n}',
+        'Stream reverse kernel missing interface pragmas, PIPELINE, and BRAM binding for dual-port access pattern.'
+    ),
+    (
+        'typedef struct { int x; int y; int z; } point_t;\nvoid top(point_t pts[1024], int dists[1024]) {\n  for (int i = 0; i < 1024; i++)\n    dists[i] = pts[i].x*pts[i].x + pts[i].y*pts[i].y + pts[i].z*pts[i].z;\n}',
+        'typedef struct { int x; int y; int z; } point_t;\nvoid top(point_t pts[1024], int dists[1024]) {\n  #pragma HLS DATA_PACK variable=pts\n  for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    point_t p = pts[i];\n    dists[i] = p.x*p.x + p.y*p.y + p.z*p.z;\n  }\n}',
+        'Struct array without DATA_PACK is split into separate arrays by HLS; pack to enable single-port access per struct.'
+    ),
+    (
+        'void fir(int input[N], int output[N], int coeffs[TAPS]) {\n  static int shift_reg[TAPS];\n  for (int i = 0; i < N; i++) {\n    #pragma HLS PIPELINE II=1\n    int acc = 0;\n    for (int j = TAPS-1; j > 0; j--)\n      shift_reg[j] = shift_reg[j-1];\n    shift_reg[0] = input[i];\n    for (int j = 0; j < TAPS; j++)\n      acc += shift_reg[j] * coeffs[j];\n    output[i] = acc;\n  }\n}',
+        'void fir(int input[N], int output[N], int coeffs[TAPS]) {\n  #pragma HLS ARRAY_PARTITION variable=coeffs complete\n  static int shift_reg[TAPS];\n  #pragma HLS ARRAY_PARTITION variable=shift_reg complete\n  for (int i = 0; i < N; i++) {\n    #pragma HLS PIPELINE II=1\n    int acc = 0;\n    shift_loop: for (int j = TAPS-1; j > 0; j--)\n      #pragma HLS UNROLL\n      shift_reg[j] = shift_reg[j-1];\n    shift_reg[0] = input[i];\n    mac_loop: for (int j = 0; j < TAPS; j++)\n      #pragma HLS UNROLL\n      acc += shift_reg[j] * coeffs[j];\n    output[i] = acc;\n  }\n}',
+        'FIR filter shift register and MAC without partition/unroll cannot achieve II=1; fully partition and unroll inner loops.'
+    ),
+    (
+        'void krnl(int* a, int* b, int n) {\n  #pragma HLS INTERFACE m_axi port=a bundle=gmem\n  #pragma HLS INTERFACE m_axi port=b bundle=gmem\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    b[i] = a[i] * 2;\n  }\n}',
+        'void krnl(int* a, int* b, int n) {\n  #pragma HLS INTERFACE m_axi port=a bundle=gmem0 max_read_burst_length=256\n  #pragma HLS INTERFACE m_axi port=b bundle=gmem1 max_write_burst_length=256\n  #pragma HLS INTERFACE s_axilite port=a\n  #pragma HLS INTERFACE s_axilite port=b\n  #pragma HLS INTERFACE s_axilite port=n\n  #pragma HLS INTERFACE s_axilite port=return\n  int buf_a[256], buf_b[256];\n  for (int offset = 0; offset < n; offset += 256) {\n    int len = (offset+256 < n) ? 256 : n - offset;\n    memcpy(buf_a, a+offset, len*sizeof(int));\n    for (int i = 0; i < len; i++)\n      #pragma HLS PIPELINE II=1\n      buf_b[i] = buf_a[i] * 2;\n    memcpy(b+offset, buf_b, len*sizeof(int));\n  }\n}',
+        'Read and write on same gmem bundle serialize; split bundles, add burst hints, tile with local buffers.'
+    ),
+    (
+        'extern "C" void vadd(ap_uint<256>* in1, ap_uint<256>* in2, ap_uint<256>* out, int n) {\n  for (int i = 0; i < n; i++) {\n    out[i] = in1[i] + in2[i]; // 256-bit add\n  }\n}',
+        'extern "C" void vadd(ap_uint<256>* in1, ap_uint<256>* in2, ap_uint<256>* out, int n) {\n  #pragma HLS INTERFACE m_axi port=in1 bundle=gmem0 offset=slave\n  #pragma HLS INTERFACE m_axi port=in2 bundle=gmem1 offset=slave\n  #pragma HLS INTERFACE m_axi port=out bundle=gmem2 offset=slave\n  #pragma HLS INTERFACE s_axilite port=in1\n  #pragma HLS INTERFACE s_axilite port=in2\n  #pragma HLS INTERFACE s_axilite port=out\n  #pragma HLS INTERFACE s_axilite port=n\n  #pragma HLS INTERFACE s_axilite port=return\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    out[i] = in1[i] + in2[i];\n  }\n}',
+        'Wide-data kernel entirely missing pragmas; needs per-port bundles, s_axilite, and PIPELINE.'
+    ),
+    (
+        'void top(int A[1024]) {\n  #pragma HLS ARRAY_PARTITION variable=A cyclic factor=4\n  for (int i = 0; i < 1024; i += 4) {\n    #pragma HLS PIPELINE II=1\n    for (int j = 0; j < 4; j++)\n      A[i+j] = A[i+j] + 1;\n  }\n}',
+        'void top(int A[1024]) {\n  #pragma HLS ARRAY_PARTITION variable=A cyclic factor=4\n  for (int i = 0; i < 1024; i += 4) {\n    #pragma HLS PIPELINE II=1\n    for (int j = 0; j < 4; j++)\n      #pragma HLS UNROLL\n      A[i+j] = A[i+j] + 1;\n  }\n}',
+        'Inner loop accessing partitioned array not unrolled; partition is useless without matching UNROLL.'
+    ),
+    (
+        'void top(hls::stream<int>& in, int table[256], hls::stream<int>& out) {\n  #pragma HLS BIND_STORAGE variable=table type=ROM_1P impl=LUTRAM\n  for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    int idx = in.read();\n    int val1 = table[idx & 0xFF];\n    int val2 = table[(idx >> 8) & 0xFF];\n    out.write(val1 + val2);\n  }\n}',
+        'void top(hls::stream<int>& in, int table[256], hls::stream<int>& out) {\n  #pragma HLS BIND_STORAGE variable=table type=ROM_2P impl=LUTRAM\n  for (int i = 0; i < 1024; i++) {\n    #pragma HLS PIPELINE II=1\n    int idx = in.read();\n    int val1 = table[idx & 0xFF];\n    int val2 = table[(idx >> 8) & 0xFF];\n    out.write(val1 + val2);\n  }\n}',
+        'Two reads per cycle from ROM_1P gives II=2; use ROM_2P for dual-port lookup.'
+    ),
+    (
+        'void dma_s2mm(hls::stream<ap_axiu<64,0,0,0>>& s, ap_uint<64>* mem, int n) {\n  for (int i = 0; i < n; i++) {\n    mem[i] = s.read().data;\n  }\n}',
+        'void dma_s2mm(hls::stream<ap_axiu<64,0,0,0>>& s, ap_uint<64>* mem, int n) {\n  #pragma HLS INTERFACE axis port=s\n  #pragma HLS INTERFACE m_axi port=mem offset=slave bundle=gmem max_write_burst_length=64\n  #pragma HLS INTERFACE s_axilite port=mem\n  #pragma HLS INTERFACE s_axilite port=n\n  #pragma HLS INTERFACE s_axilite port=return\n  ap_uint<64> buf[64];\n  for (int offset = 0; offset < n; offset += 64) {\n    int len = (offset+64<n) ? 64 : n-offset;\n    for (int i = 0; i < len; i++)\n      #pragma HLS PIPELINE II=1\n      buf[i] = s.read().data;\n    memcpy(mem+offset, buf, len*sizeof(ap_uint<64>));\n  }\n}',
+        'S2MM DMA missing all pragmas and writing one element at a time; add interfaces, tile with buffer for write burst.'
+    ),
+    (
+        'void top(float a[N], float b[N], float& dot) {\n  dot = 0;\n  for (int i = 0; i < N; i++)\n    dot += a[i] * b[i];\n}',
+        'void top(float a[N], float b[N], float& dot) {\n  #pragma HLS ARRAY_PARTITION variable=a cyclic factor=8\n  #pragma HLS ARRAY_PARTITION variable=b cyclic factor=8\n  float partial[8] = {0};\n  #pragma HLS ARRAY_PARTITION variable=partial complete\n  for (int i = 0; i < N; i += 8) {\n    #pragma HLS PIPELINE II=1\n    for (int j = 0; j < 8; j++)\n      #pragma HLS UNROLL\n      partial[j] += a[i+j] * b[i+j];\n  }\n  float sum = 0;\n  for (int j = 0; j < 8; j++)\n    #pragma HLS UNROLL\n    sum += partial[j];\n  dot = sum;\n}',
+        'Dot product with single accumulator has loop-carried dependency at float latency (~7 cycles); use partial sums with factor=8 to hide FP latency.'
+    ),
+    (
+        'void relu(float data[1024]) {\n  for (int i = 0; i < 1024; i++)\n    if (data[i] < 0) data[i] = 0;\n}',
+        'void relu(hls::stream<float>& in, hls::stream<float>& out, int n) {\n  for (int i = 0; i < n; i++) {\n    #pragma HLS PIPELINE II=1\n    float val = in.read();\n    out.write(val < 0 ? 0.0f : val);\n  }\n}',
+        'In-place ReLU on array prevents dataflow integration; convert to stream-in/stream-out for composability.'
     ),
 ]
 
@@ -860,4 +973,53 @@ def create_super_dataset():
 
 
 if __name__ == "__main__":
-    create_super_dataset()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cycles', type=int, default=1,
+                        help='Number of corruption cycles (each uses a different seed)')
+    args = parser.parse_args()
+
+    if args.cycles <= 1:
+        create_super_dataset()
+    else:
+        # Multi-cycle: run corruption generation multiple times with different
+        # seeds, accumulate unique debug samples, write once at the end.
+        all_train = []
+        all_eval  = []
+        seen_hashes = set()
+
+        for cycle in range(args.cycles):
+            print(f"\n{'='*60}")
+            print(f"  CYCLE {cycle+1} / {args.cycles}  (seed={RANDOM_SEED + cycle})")
+            print(f"{'='*60}")
+            random.seed(RANDOM_SEED + cycle)
+            create_super_dataset()
+
+            # Read the just-written files and merge
+            with open(OUTPUT_TRAIN, 'r', encoding='utf-8') as f:
+                for line in f:
+                    h = hashlib.md5(line.strip().encode()).hexdigest()
+                    if h not in seen_hashes:
+                        seen_hashes.add(h)
+                        all_train.append(line)
+            with open(OUTPUT_EVAL, 'r', encoding='utf-8') as f:
+                for line in f:
+                    h = hashlib.md5(line.strip().encode()).hexdigest()
+                    if h not in seen_hashes:
+                        seen_hashes.add(h)
+                        all_eval.append(line)
+
+        # Write merged results
+        random.shuffle(all_train)
+        random.shuffle(all_eval)
+        with open(OUTPUT_TRAIN, 'w', encoding='utf-8') as f:
+            f.writelines(all_train)
+        with open(OUTPUT_EVAL, 'w', encoding='utf-8') as f:
+            f.writelines(all_eval)
+
+        print(f"\n{'='*60}")
+        print(f"  MULTI-CYCLE MERGED RESULTS ({args.cycles} cycles)")
+        print(f"{'='*60}")
+        print(f"  Train: {len(all_train):,} unique rows")
+        print(f"  Eval:  {len(all_eval):,} unique rows")
+        print(f"  Total: {len(all_train)+len(all_eval):,}")
